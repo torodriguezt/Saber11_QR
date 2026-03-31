@@ -157,12 +157,12 @@ TOL <- 0.01          # tolerancia en cambio relativo de sigma_ald
 DAMP <- 0.3          # factor de amortiguamiento (0 = sin cambio, 1 = cambio total)
 sigma_ald <- 10       # estimacion inicial conservadora
 
-# Inicializar w_i = E[Exp(1/sigma_ald)] = sigma_ald
-w <- rep(sigma_ald, N)
+# Inicializar w_i = E[Exp(1)] = 1  (exponencial unitaria)
+w     <- rep(1, N)       # E[W_i]: para la pseudo-respuesta y_tilde
+inv_w <- rep(1, N)       # E[1/W_i]: para el scale de INLA (precision)
 
-# Clipear w para estabilidad numerica
+# Clipear para estabilidad numerica
 clip_w <- function(w_vec) pmax(pmin(w_vec, 1e4), 1e-6)
-w <- clip_w(w)
 
 cat("\n========== Iniciando EM con INLA ==========\n")
 
@@ -173,9 +173,9 @@ for (iter in 1:MAX_ITER) {
   delta <- sigma_ald * delta_unit
   gamma_sq <- sigma_ald^2 * gamma_unit
 
-  # Respuesta ajustada y pesos de precision
+  # Respuesta ajustada (E[W]) y pesos de precision (E[1/W])
   datos$y_tilde <- datos$y - delta * w
-  scale_vec <- clip_w(1 / w)
+  scale_vec <- clip_w(inv_w)
 
   fit <- inla(
     formula_mod,
@@ -184,7 +184,7 @@ for (iter in 1:MAX_ITER) {
     scale = scale_vec,
     control.compute = list(config = FALSE),
     control.predictor = list(compute = TRUE, link = 1),
-    control.inla = list(strategy = "gaussian", int.strategy = "eb"),
+    control.inla = list(strategy = "simplified.laplace", int.strategy = "ccd"),
     num.threads = parallel::detectCores(),
     verbose = FALSE,
     safe = FALSE
@@ -201,32 +201,36 @@ for (iter in 1:MAX_ITER) {
   # --- M-step: actualizar w_i desde la posterior GIG(1/2, a, b) ---
   # E[w] = sqrt(b/a) * (1 + 1/sqrt(a*b))  (formula cerrada para p=1/2)
   resid <- datos$y - mu_fitted
-  a_gig <- delta^2 / gamma_sq + 2 / sigma_ald
+  # Prior w ~ Exp(1): contribuye exp(-w), coeficiente en a = 2
+  a_gig <- delta^2 / gamma_sq + 2
   b_gig <- resid^2 / gamma_sq
 
   # Evitar division por cero
   b_gig <- pmax(b_gig, 1e-10)
 
-  # E[w_i] para GIG(1/2, a, b): formula cerrada
+  # GIG(1/2, a, b): formulas cerradas
   sqrt_ab <- sqrt(a_gig * b_gig)
-  # Para GIG(p, a, b) con p = 1/2:
-  # E[X] = sqrt(b/a) * K_{3/2}(sqrt(ab)) / K_{1/2}(sqrt(ab))
-  # K_{1/2}(x) = sqrt(pi/(2x)) * exp(-x)
-  # K_{3/2}(x) = sqrt(pi/(2x)) * exp(-x) * (1 + 1/x)
-  # => E[X] = sqrt(b/a) * (1 + 1/sqrt(ab))
-  w_new <- sqrt(b_gig / a_gig) * (1 + 1 / pmax(sqrt_ab, 1e-10))
-  w_new <- clip_w(w_new)
+
+  # E[W] para la pseudo-respuesta (y_tilde = y - delta*E[W])
+  e_w     <- sqrt(b_gig / a_gig) * (1 + 1 / pmax(sqrt_ab, 1e-10))
+  e_w     <- clip_w(e_w)
+
+  # E[1/W] para el scale de INLA (Q-function requiere E[1/W], no 1/E[W])
+  # Para GIG(1/2, a, b): E[1/W] = sqrt(a/b)
+  e_inv_w <- clip_w(sqrt(a_gig / b_gig))
 
   # Actualizaciones amortiguadas para evitar oscilaciones
   sigma_ald_damped <- DAMP * sigma_ald_new + (1 - DAMP) * sigma_ald
-  w_damped <- DAMP * w_new + (1 - DAMP) * w
+  w_damped         <- DAMP * e_w     + (1 - DAMP) * w
+  inv_w_damped     <- DAMP * e_inv_w + (1 - DAMP) * inv_w
 
   # Convergencia: cambio relativo en sigma_ald
   rel_change <- abs(sigma_ald_damped - sigma_ald) / max(abs(sigma_ald), 1e-10)
   sigma_ald <- sigma_ald_damped
 
-  # Actualizar w
-  w <- w_damped
+  # Actualizar w y inv_w
+  w     <- w_damped
+  inv_w <- inv_w_damped
 
   t_elapsed <- as.numeric(difftime(Sys.time(), t_start, units = "secs"))
 
@@ -243,8 +247,15 @@ for (iter in 1:MAX_ITER) {
 # 7. Ajuste final con estrategia completa (no simplificada)
 # =============================================================================
 cat("\n>>> Ajuste final con estrategia completa...\n")
-datos$y_tilde <- datos$y - sigma_ald * delta_unit * w
-scale_vec_final <- clip_w(1 / w)
+delta_final <- sigma_ald * delta_unit
+gamma_sq_final <- sigma_ald^2 * gamma_unit
+datos$y_tilde <- datos$y - delta_final * w
+
+# Recalcular E[1/W] con los parametros finales del EM
+resid_final   <- datos$y - mu_fitted
+a_gig_final   <- delta_final^2 / gamma_sq_final + 2
+b_gig_final   <- pmax(resid_final^2 / gamma_sq_final, 1e-10)
+scale_vec_final <- clip_w(sqrt(a_gig_final / b_gig_final))
 
 fit_final <- inla(
   formula_mod,
